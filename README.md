@@ -47,6 +47,10 @@ DATABASE_PATH=data/plans.db
 ALLOWED_CHANNEL_ID=
 REMINDER_CHANNEL_ID=
 REMINDER_TIME=09:00
+LOL_PATCH_CHANNEL_ID=
+LOL_PATCH_LOCALE=zh-tw
+LOL_PATCH_CHECK_MINUTES=30
+LOL_PATCH_AUTO_POST=true
 ```
 
 ## 限定指令頻道
@@ -91,16 +95,3 @@ bot 已加入單一執行鎖。如果同一個專案已經有一份 bot 在執�
 1. 開啟 `MESSAGE CONTENT INTENT`。
 2. 邀請 bot 時至少給 `Send Messages`、`Read Message History` 權限。
 
-## 上傳到 GitHub
-
-請確認 `.env` 不要上傳，專案已用 `.gitignore` 排除。
-
-```powershell
-cd E:\Codex\discord-bot
-git init
-git add .
-git commit -m "Initial Discord daily planner bot"
-git branch -M main
-git remote add origin https://github.com/<你的帳號>/<你的 repo>.git
-git push -u origin main
-```
