@@ -458,8 +458,10 @@ async def check_lol_patch_note(
         if not isinstance(channel, discord.abc.Messageable):
             raise RuntimeError("LOL_PATCH_CHANNEL_ID 指定的頻道無法發送訊息")
 
-        await send_lol_patch_note(channel, patch_note, categories or set(LOL_PATCH_DEFAULT_CATEGORIES))
+        # 先記錄已處理版本，避免完整公告發送途中某張圖或某段訊息失敗後，
+        # 下一輪排程又把同一版公告重複發布一次。
         store.set_state("last_lol_patch_note_id", patch_note["id"] or "")
+        await send_lol_patch_note(channel, patch_note, categories or set(LOL_PATCH_DEFAULT_CATEGORIES))
 
     store.set_state("last_lol_patch_checked_at", datetime.now(TAIPEI_TZ).isoformat(timespec="seconds"))
     return patch_note, should_post

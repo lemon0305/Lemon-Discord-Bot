@@ -4,6 +4,7 @@ from datetime import datetime  # 解析 Riot 官方文章的發布時間，並�
 from html import unescape  # 將 HTML entity 還原成正常文字，例如 &amp; 變成 &。
 from html.parser import HTMLParser  # 建立簡易 HTML 解析器，把官方公告拆成文字區塊與圖片區塊。
 from typing import Any  # 標註 patch_note 這類混合字典，裡面可能有文字、圖片、時間等不同型別。
+from urllib.parse import parse_qs, unquote, urlsplit  # 判斷圖片副檔名時忽略 Riot 圖片網址後面的 query string。
 
 import aiohttp  # 非同步抓取 Riot 官方網站內容，不會卡住 Discord bot。
 import discord  # 建立 Discord Embed、發送圖片與文字公告。
@@ -32,7 +33,8 @@ LOL_PATCH_CATEGORY_KEYWORDS = {
     "arena": ("競技場",),
 }
 LOL_PATCH_ALWAYS_INCLUDE_HEADINGS = {"版本概要"}
-LOL_PATCH_PLAIN_IMAGE_HEADINGS = {"全新造型與炫彩造型"}
+LOL_PATCH_PLAIN_IMAGE_HEADINGS = {"版本概要", "全新造型與炫彩造型"}
+LOL_CHAMPION_ICON_CACHE: dict[str, str] = {}
 
 
 
@@ -66,7 +68,21 @@ def is_lol_image_url(url: str) -> bool:
         return False
 
     clean_url = unescape(url).lower()
-    return clean_url.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
+    image_path = urlsplit(resolve_lol_image_url(clean_url)).path
+    return image_path.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
+
+
+def resolve_lol_image_url(url: str) -> str:
+    """把 Riot 圖片代理網址轉成真正圖片網址。
+
+    官方公告常用 `https://am-a.akamaihd.net/image?f=https://ddragon...png`，
+    Discord 縮圖直接使用 `f` 裡的圖片網址比較穩。
+    """
+    parsed = urlsplit(unescape(url))
+    proxy_target = parse_qs(parsed.query).get("f", [""])[0]
+    if parsed.netloc.endswith("akamaihd.net") and parsed.path == "/image" and proxy_target:
+        return unquote(proxy_target)
+    return url
 
 
 def get_lol_image_dimensions(url: str) -> tuple[int, int] | None:
@@ -84,8 +100,14 @@ def classify_lol_image(url: str) -> str:
     版本概要、造型展示等圖片通常寬高較大，所以用一般大圖 Embed 顯示。
     """
     lower_url = unescape(url).lower()
-    # 只把英雄與物品視為可顯示 icon；技能圖示會在 _add_image 直接略過。
-    if "/img/champion/" in lower_url or "/img/item/" in lower_url:
+    # 英雄、物品、召喚師技能等小圖示都可作為卡片縮圖；
+    # 英雄卡片後續會改用 Data Dragon 頭像，避免技能圖誤配到英雄。
+    if (
+        "/img/champion/" in lower_url
+        or "/img/item/" in lower_url
+        or "/img/spell/" in lower_url
+        or "/img/passive/" in lower_url
+    ):
         return "icon"
 
     dimensions = get_lol_image_dimensions(url)
@@ -255,13 +277,9 @@ class LolPatchBodyParser(HTMLParser):
             return
 
         raw_url = attrs.get("src") or attrs.get("data-src") or first_srcset_url(attrs.get("srcset", ""))
-        url = absolute_lol_url(raw_url.strip())
+        url = resolve_lol_image_url(absolute_lol_url(raw_url.strip()))
         if not is_lol_image_url(url) or url in self.seen_images:
             return
-        # 使用者目前只想保留英雄/裝備縮圖；技能圖示不顯示，避免版面太碎。
-        if is_lol_spell_icon(url):
-            return
-
         if self.current_tag and normalize_space(" ".join(self.current_text)):
             self._flush_text()
         self.seen_images.add(url)
@@ -489,6 +507,56 @@ async def fetch_lol_page(url: str) -> str:
             return await response.text()
 
 
+async def fetch_lol_json(url: str) -> Any:
+    """下載 Riot / Data Dragon JSON 資料。"""
+    headers = {
+        "User-Agent": "LemonDiscordBot/1.0",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.7",
+    }
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as response:
+            response.raise_for_status()
+            return await response.json()
+
+
+async def get_lol_champion_icon_map(locale: str = "zh_TW") -> dict[str, str]:
+    """建立繁中英雄名稱到 Data Dragon 頭像 URL 的對照表。"""
+    global LOL_CHAMPION_ICON_CACHE
+    if LOL_CHAMPION_ICON_CACHE:
+        return LOL_CHAMPION_ICON_CACHE
+
+    versions = await fetch_lol_json("https://ddragon.leagueoflegends.com/api/versions.json")
+    latest_version = versions[0]
+    champion_data = await fetch_lol_json(
+        f"https://ddragon.leagueoflegends.com/cdn/{latest_version}/data/{locale}/champion.json"
+    )
+
+    icon_map: dict[str, str] = {}
+    for champion in champion_data.get("data", {}).values():
+        name = str(champion.get("name", "")).strip()
+        image_name = champion.get("image", {}).get("full")
+        if not name or not image_name:
+            continue
+        icon_map[name] = f"https://ddragon.leagueoflegends.com/cdn/{latest_version}/img/champion/{image_name}"
+
+    LOL_CHAMPION_ICON_CACHE = icon_map
+    return icon_map
+
+
+async def get_lol_champion_icon_url(champion_name: str) -> str | None:
+    """用英雄中文名稱取得官方 Data Dragon 頭像。"""
+    clean_name = champion_name.strip()
+    if not clean_name:
+        return None
+
+    try:
+        icon_map = await get_lol_champion_icon_map()
+    except Exception:
+        return None
+
+    return icon_map.get(clean_name)
+
+
 async def fetch_latest_lol_patch_note(locale: str) -> dict[str, Any]:
     """抓取指定語系最新一篇 LoL 版本公告，整理成 dict 給 Embed 使用。"""
     tag_url = f"{LOL_PATCH_BASE_URL}/{locale}/news/tags/patch-notes/"
@@ -553,6 +621,8 @@ def build_lol_patch_embed(patch_note: dict[str, Any]) -> discord.Embed:
             embed.timestamp = datetime.fromisoformat(patch_note["published_at"].replace("Z", "+00:00"))
         except ValueError:
             pass
+    if patch_note.get("image") and is_lol_image_url(str(patch_note["image"])):
+        embed.set_image(url=str(patch_note["image"]))
     return embed
 
 
@@ -855,8 +925,12 @@ async def send_lol_card(channel: discord.abc.Messageable, section: list[dict[str
         block_type = block.get("type")
         if block_type == "icon":
             url = block.get("url", "")
-            # 縮圖只抓英雄/裝備 icon；技能 icon 已在解析階段被過濾。
-            if not is_lol_spell_icon(url) and not thumbnail_url:
+            # 英雄卡片一律用 Data Dragon 依英雄名稱補頭像，避免官方公告中技能/被動圖示
+            # 被 HTML 位置誤判成下一位英雄的縮圖。
+            if fallback_title == "英雄改動":
+                continue
+            # 非英雄卡片可以使用公告內的小圖示，例如系統改動的傳送 icon。
+            if not thumbnail_url:
                 thumbnail_url = url
             continue
 
@@ -881,6 +955,8 @@ async def send_lol_card(channel: discord.abc.Messageable, section: list[dict[str
         description = description[:3990].rstrip() + "..."
 
     embed = discord.Embed(title=title, description=description or "官方公告未提供詳細文字。", color=LOL_PATCH_COLOR)
+    if fallback_title == "英雄改動":
+        thumbnail_url = await get_lol_champion_icon_url(title)
     if thumbnail_url:
         embed.set_thumbnail(url=thumbnail_url)
     await channel.send(embed=embed)
@@ -903,12 +979,15 @@ async def send_lol_text(channel: discord.abc.Messageable, text: str) -> None:
 
 
 async def send_lol_image(channel: discord.abc.Messageable, url: str, alt: str) -> None:
-    """直接送官方圖片網址。
+    """用 Embed 發送官方圖片，讓 Discord 更穩定產生圖片預覽。
 
-    不用自訂 Embed，避免 Discord 上出現框線或標題文字。
     小圖示不走這裡，避免在 Discord 上造成版面跑掉。
     """
     if not url:
         return
 
-    await channel.send(url)
+    embed = discord.Embed(color=LOL_PATCH_COLOR)
+    if alt:
+        embed.description = alt
+    embed.set_image(url=url)
+    await channel.send(embed=embed)
